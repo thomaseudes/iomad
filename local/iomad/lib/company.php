@@ -2222,12 +2222,11 @@ class company {
         $userdepartments = $DB->get_records('company_users', array('userid' => $userid, 'companyid' => $this->id));
 
         // Set the initial return array.
-
         $managers = array();
         $departments = array();
         // Get the list of parent departments.
-        foreach ($userdepartments as $userdepartmentid => $junk) {
-            if ($userdepartment = $this->get_departmentbyid($userdepartmentid)) {
+        foreach ($userdepartments as $companyuserrec) {
+            if ($userdepartment = $this->get_departmentbyid($companyuserrec->departmentid)) {
                 $departmentlist = $this->get_parentdepartments($userdepartment);
                 self::get_parents_list($departmentlist, $departments);
             }
@@ -3874,25 +3873,20 @@ class company {
         }
 
         // Do not send if this is already recorded.
-        if (!empty($enrolrec->timestart) &&
-            ( $DB->get_record_sql("SELECT id FROM {local_iomad_track}
+        if (!empty($enrolrec->timestart)) {
+            if ($trackrec = $DB->get_record_sql("SELECT * FROM {local_iomad_track}
                                     WHERE userid=:userid
                                     AND courseid = :courseid
-                                    AND timeenrolled <= :timeenrolled
-                                    AND timecompleted IS NOT NULL",
+                                    AND timeenrolled > :timelow
+                                    AND timeenrolled < :timehigh",
                                     array('userid' => $userid,
                                           'courseid' => $courseid,
-                                          'timeenrolled' => $enrolrec->timestart))
-            && $DB->get_record_sql("SELECT id FROM {local_iomad_track}
-                                    WHERE userid=:userid
-                                    AND courseid = :courseid
-                                    AND timeenrolled <= :timeenrolled
-                                    AND timecompleted != :timecompleted",
-                                    array('userid' => $userid,
-                                          'courseid' => $courseid,
-                                          'timecompleted' => $completionrec->timecompleted,
-                                          'timeenrolled' => $enrolrec->timestart)))) {
-            return true;
+                                          'timelow' => $enrolrec->timestart - 10,
+                                          'timehigh' => $enrolrec->timestart + 10))) {
+                if ($trackrec->timecompleted !=null && (round($trackrec->timecompleted  / 10 ) * 10) != (round($completionrec->timecompleted /10) *10)) {
+                    return true;
+                }
+            }
         }
 
         $course = $DB->get_record('course', array('id' => $courseid));
@@ -3919,15 +3913,8 @@ class company {
         }
 
         $complete = false;
-        if ($licenses = $DB->get_records_sql("SELECT * FROM {companylicense_users} clu
-                                              JOIN {companylicense} cl
-                                              ON (clu.licenseid = cl.id and cl.program = 1)
-                                              WHERE clu.userid = :userid
-                                              AND clu.licenseid = (
-                                                  SELECT licenseid FROM {companylicense_users}
-                                                  WHERE userid = :userid2
-                                                  AND licensecourseid = :courseid)",
-                                              array('userid' => $user->id, 'userid2' => $user->id, 'courseid' => $courseid))) {
+        if(!empty($trackinfo->licenseid) && $DB->get_record('companylicense', array('id' => $trackinfo->licenseid, 'program' => 1))) {
+            $licenses = $DB->get_records('companylicense_users', array('licenseid' => $track->licenseid));
             foreach ($licenses as $license) {
                 if ($license->isusing && $DB->get_record_sql("SELECT id FROM {course_completions}
                                                               WHERE userid = :userid
@@ -4507,7 +4494,64 @@ class company {
                                              'isusing' => 0,
                                              'licensecourseid' => $currentcourse->courseid,
                                              'issuedate' => time());
-                            $DB->insert_record('companylicense_users', $userlic);
+                            $userlicid = $DB->insert_record('companylicense_users', $userlic);
+
+                            // Is this an immediate license?
+                            if (!empty($licenserecord->instant)) {
+                                if (self::license_ok_to_use($licenseid, $currcourseid, $licuser->userid)) {
+                                    if ($instance = $DB->get_record('enrol', array('courseid' => $currentcourse->courseid, 'enrol' => 'license'))) {
+                                        // Enrol the user on the course.
+                                        $enrol = enrol_get_plugin('license');
+
+                                        // Enrol the user in the course.
+                                        // Is the license available yet?
+                                        if (!empty($licenserecord->startdate) && $licenserecord->startdate > time()) {
+                                            // If not set up the enrolment from when it is.
+                                            $timestart = $licenserecord->startdate;
+                                        } else {
+                                            // Otherwise start it now.
+                                            $timestart = time();
+                                        }
+
+                                        if ($licenserecord->type == 0 || $licenserecord->type == 2) {
+                                            // Set the timeend to be time start + the valid length for the license in days.
+                                            $timeend = $timestart + ($licenserecord->validlength * 24 * 60 * 60 );
+                                        } else {
+                                            // Set the timeend to be when the license runs out.
+                                            $timeend = $licenserecord->expirydate;
+                                        }
+
+                                        if ($licenserecord->type < 2) {
+                                            $enrol->enrol_user($instance, $licuser->userid, $instance->roleid, $timestart, $timeend);
+                                        } else {
+                                            // Educator role.
+                                            if ($DB->get_record('iomad_courses', array('courseid' => $currentcourse->courseid, 'shared' => 0))) {
+                                                // Not shared.
+                                                $role = $DB->get_record('role', array('shortname' => 'companycourseeditor'));
+                                            } else {
+                                                // Shared.
+                                                $role = $DB->get_record('role', array('shortname' => 'companycoursenoneditor'));
+                                            }
+                                            $enrol->enrol_user($instance, $licuser->userid, $role->id, $timestart, $timeend);
+                                        }
+
+                                        // Get the userlicense record.
+                                        $userlicense = $DB->get_record('companylicense_users', array('id' => $userlicid));
+
+                                        // Update the userlicense record to mark it as in use.
+                                        $DB->set_field('companylicense_users', 'isusing', 1, array('id' => $userlicense->id));
+
+                                        // Fire an event to record this
+                                        $eventother = array('licenseid' => $licenseid);
+                                        $event = \block_iomad_company_admin\event\user_license_used::create(array('context' => \context_course::instance($currcourseid),
+                                                                                                                  'objectid' => $userlicense->id,
+                                                                                                                  'courseid' => $instance->courseid,
+                                                                                                                  'userid' => $licuser->userid,
+                                                                                                                  'other' => $eventother));
+                                        $event->trigger();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
